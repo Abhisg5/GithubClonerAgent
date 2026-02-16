@@ -62,6 +62,16 @@ python clone_repos.py --pull-only
 | `--require-branch BRANCH` | In `--status`, warn when repo is not on this branch (e.g. `main`) |
 | `--ssh` | Use SSH clone URLs |
 
+## Email notification (Mac and Windows)
+
+When the 2 AM sync (or a manual `--sync` / `--pull-only`) finishes, you can get an email with a short summary (e.g. *"Cloned: 2, Pulled: 15"*). Same behavior on **macOS and Windows**.
+
+1. Copy `config.example.json` to `config.json`.
+2. Set **notify_email**, **smtp_host**, **smtp_port**, **smtp_user**. For the password, use one of: **smtp_password** in the file, env var **GITHUB_CLONER_AGENT_SMTP_PASSWORD**, or **smtp_password_gist_raw_url** (see below) so the script fetches it from a secret gist at runtime.
+3. Run `--setup-schedule` as usual. The scheduled job reads `config.json`; when it finishes, it sends the email if SMTP is configured.
+
+**Example (Gmail):** Use an [App Password](https://support.google.com/accounts/answer/185833) (not your normal password). In `config.json`: `smtp_host`: `smtp.gmail.com`, `smtp_port`: `587`, `smtp_user`: your Gmail, `notify_email`: the address to receive the summary (can be the same), and put the app password in `smtp_password` or in `GITHUB_CLONER_AGENT_SMTP_PASSWORD`.
+
 ## Config file
 
 Optional `config.json` in the `GithubClonerAgent` folder sets defaults (CLI flags still override):
@@ -75,11 +85,47 @@ Optional `config.json` in the `GithubClonerAgent` folder sets defaults (CLI flag
   "only": "",
   "shallow": false,
   "jobs": 2,
-  "require_branch": "main"
+  "require_branch": "main",
+  "notify_email": "you@example.com",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "your@gmail.com",
+  "smtp_from": "",
+  "smtp_password": "",
+  "smtp_password_gist_raw_url": ""
 }
 ```
 
-Copy `config.example.json` to `config.json` and edit.
+- **smtp_password:** Leave empty if you use the env var or gist.
+- **GITHUB_CLONER_AGENT_SMTP_PASSWORD:** Set in the environment to supply the password without putting it in the file.
+- **smtp_password_gist_raw_url:** Optional. The **Raw** URL of a secret gist whose only content is the app password (e.g. `https://gist.githubusercontent.com/USER/GIST_ID/raw/gistfile1.txt`). The script fetches it at runtime so you don’t set the env var on each machine. Keep this URL only in `config.json` (never commit it). Copy `config.example.json` to `config.json` and edit.
+
+### Keeping the SMTP password secret (public repo + multiple computers)
+
+The repo can stay **public** and your app password stays **private**:
+
+1. **Never commit the password.**  
+   `config.json` is in `.gitignore`, so it never gets pushed. In `config.json`, leave `smtp_password` empty (`""`).
+
+2. **Use the environment variable.**  
+   Set your app password in **GITHUB_CLONER_AGENT_SMTP_PASSWORD** (not in any file). The script reads it at runtime.
+
+3. **Store the password and use it on each computer:**
+   - **Option A – Gist (auto-fetch):** Put the app password in a **secret gist** (one file, content = password only). In `config.json` set **smtp_password_gist_raw_url** to that gist’s **Raw** URL (e.g. `https://gist.githubusercontent.com/USER/GIST_ID/raw/filename.txt`). The script will fetch the password from the gist when it runs. No env var needed. Keep the URL only in `config.json` (gitignored); never commit it.
+   - **Option B – Env var:** Set **GITHUB_CLONER_AGENT_SMTP_PASSWORD** on each machine. Store the password in a password manager or a private gist and copy it when setting up a new computer.
+
+4. **Set the env var on each machine** so the script (and the 2 AM scheduled task) can use it:
+   - **Windows:**  
+     `System Properties` → `Advanced` → `Environment Variables` → under “User variables” add `GITHUB_CLONER_AGENT_SMTP_PASSWORD` = your app password.  
+     Or in PowerShell (current user, persistent):  
+     `[System.Environment]::SetEnvironmentVariable('GITHUB_CLONER_AGENT_SMTP_PASSWORD', 'your-app-password', 'User')`  
+     Restart the terminal (and ensure the scheduled task runs as the same user so it sees the variable).
+   - **macOS:**  
+     Add to `~/.zshrc` or `~/.bash_profile`:  
+     `export GITHUB_CLONER_AGENT_SMTP_PASSWORD='your-app-password'`  
+     Then `source ~/.zshrc` (or reopen the terminal). Cron runs with your user, so it will see this if you use a login shell or set it in your profile.
+
+After that you can push the repo to GitHub as public; the app password only exists in your env and in your private gist or password manager.
 
 ## Scheduled sync (2 AM EST)
 

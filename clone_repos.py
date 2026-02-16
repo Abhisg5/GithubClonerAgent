@@ -8,10 +8,17 @@ import argparse
 import fnmatch
 import json
 import os
+import platform
+import smtplib
+import ssl
 import subprocess
 import sys
+import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 GH_INSTALL_URL = "https://cli.github.com/"
 TASK_NAME = "GithubClonerAgent-daily-pull"
@@ -175,24 +182,54 @@ def find_repo_dirs(output_dir: str) -> list[str]:
     return sorted(repos)
 
 
-def pull_all_repos(output_dir: str) -> int:
-    """Run git pull in every repo under output_dir. Return number of successes."""
+def _pull_one(path: str) -> tuple[str, bool, str]:
+    """Run git pull in one repo. Returns (basename, success, error_message)."""
+    name = os.path.basename(path)
+    try:
+        r = run_cmd(["git", "-C", path, "pull"], check=False)
+        if r.returncode == 0:
+            return (name, True, "")
+        err = (r.stderr or r.stdout or "pull failed").strip().split("\n")[0][:200]
+        return (name, False, err)
+    except Exception as e:
+        return (name, False, str(e)[:200])
+
+
+def pull_all_repos(
+    output_dir: str,
+    jobs: int = 1,
+    only_repo_names: set[str] | None = None,
+) -> tuple[int, list[str], list[tuple[str, str]]]:
+    """Run git pull. If only_repo_names is set, only pull those (from your GitHub list); else all git dirs."""
     repos = find_repo_dirs(output_dir)
+    if only_repo_names is not None:
+        repos = [p for p in repos if os.path.basename(p) in only_repo_names]
     if not repos:
         print("No git repositories found.")
-        return 0
-    ok = 0
-    for path in repos:
-        try:
-            r = run_cmd(["git", "-C", path, "pull"], check=False)
-            if r.returncode == 0:
+        return 0, [], []
+    pulled_names: list[str] = []
+    failed: list[tuple[str, str]] = []
+    if jobs <= 1:
+        for path in repos:
+            name, ok, err = _pull_one(path)
+            if ok:
                 print(f"  pulled: {path}")
-                ok += 1
+                pulled_names.append(name)
             else:
-                print(f"  failed: {path} ({r.stderr or r.stdout or 'pull failed'})", file=sys.stderr)
-        except Exception as e:
-            print(f"  error in {path}: {e}", file=sys.stderr)
-    return ok
+                print(f"  failed: {path} ({err})", file=sys.stderr)
+                failed.append((name, err))
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futures = {ex.submit(_pull_one, path): path for path in repos}
+            for fut in as_completed(futures):
+                name, ok, err = fut.result()
+                if ok:
+                    print(f"  pulled: {futures[fut]}")
+                    pulled_names.append(name)
+                else:
+                    print(f"  failed: {os.path.join(output_dir, name)} ({err})", file=sys.stderr)
+                    failed.append((name, err))
+    return len(pulled_names), pulled_names, failed
 
 
 def setup_schedule_windows(output_dir: str) -> bool:
@@ -259,7 +296,7 @@ def setup_schedule_mac(output_dir: str) -> bool:
 
 
 def setup_schedule(output_dir: str) -> bool:
-    """Install daily 2 AM pull schedule for current platform."""
+    """Install daily 2 AM sync schedule for current platform. Email notification via config if set."""
     if sys.platform == "win32":
         return setup_schedule_windows(output_dir)
     if sys.platform == "darwin":
@@ -329,6 +366,148 @@ def clear_schedule() -> bool:
         return clear_schedule_mac()
     print("Schedule clear is supported on Windows and macOS only.", file=sys.stderr)
     return False
+
+
+def _fetch_password_from_gist(raw_url: str) -> str:
+    """Fetch password from a secret gist raw URL. Returns stripped content or empty string on failure."""
+    try:
+        req = urllib.request.Request(raw_url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="replace").strip()
+            return body
+    except Exception:
+        return ""
+
+
+def send_notification_email(config: dict, subject: str, body: str) -> bool:
+    """Send an email using config SMTP settings. Returns True on success. Mac and Windows."""
+    to_email = config.get("notify_email", "").strip()
+    if not to_email:
+        return False
+    host = config.get("smtp_host", "").strip()
+    user = config.get("smtp_user", "").strip()
+    password = (
+        (config.get("smtp_password") or "").strip()
+        or os.environ.get("GITHUB_CLONER_AGENT_SMTP_PASSWORD", "").strip()
+    )
+    if not password and config.get("smtp_password_gist_raw_url"):
+        password = _fetch_password_from_gist(config.get("smtp_password_gist_raw_url", "").strip())
+    if not host or not user or not password:
+        print("Email not sent: set notify_email, smtp_host, smtp_user, and smtp_password (or env GITHUB_CLONER_AGENT_SMTP_PASSWORD or smtp_password_gist_raw_url) in config.json.", file=sys.stderr)
+        return False
+    port = int(config.get("smtp_port", 587))
+    from_email = config.get("smtp_from") or user
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.attach(MIMEText(body, "plain"))
+    try:
+        # Use unverified context to avoid SSL cert strictness errors (e.g. Basic Constraints) on Windows
+        context = ssl._create_unverified_context()
+        with smtplib.SMTP(host, port) as server:
+            server.starttls(context=context)
+            server.login(user, password)
+            server.sendmail(from_email, [to_email], msg.as_string())
+        print("Notification email sent.")
+        return True
+    except Exception as e:
+        print(f"Failed to send notification email: {e}", file=sys.stderr)
+        return False
+
+
+def get_device_info() -> str:
+    """Return a short description of this machine for notification emails."""
+    host = platform.node() or "unknown"
+    system = platform.system()
+    release = platform.release()
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+    return f"{host} ({system} {release}) — user: {user}"
+
+
+def build_notification_body(
+    sync_type: str,
+    output_dir: str,
+    cloned: int,
+    pulled: int,
+    cloned_names: list[str],
+    pulled_names: list[str],
+    failed: list[tuple[str, str]] | None = None,
+) -> str:
+    """Build a descriptive email body for debugging."""
+    failed = failed or []
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    device = get_device_info()
+    lines = [
+        "GithubClonerAgent run finished",
+        "",
+        "--- Device ---",
+        device,
+        "",
+        "--- When ---",
+        now,
+        "",
+        "--- Output directory ---",
+        output_dir,
+        "",
+    ]
+    if sync_type == "sync":
+        lines.extend([
+            "--- Summary ---",
+            f"Cloned: {cloned} repo(s)",
+            f"Pulled: {pulled} repo(s)",
+        ])
+        if failed:
+            lines.append(f"Failed: {len(failed)} repo(s)")
+        lines.append("")
+        if cloned_names:
+            lines.append("--- Repos cloned ---")
+            lines.extend(f"  • {n}" for n in sorted(cloned_names))
+            lines.append("")
+        if pulled_names:
+            lines.append("--- Repos pulled ---")
+            lines.extend(f"  • {n}" for n in sorted(pulled_names))
+            lines.append("")
+    else:
+        lines.append("--- Summary ---")
+        lines.append(f"Pulled: {pulled} repo(s)")
+        if failed:
+            lines.append(f"Failed: {len(failed)} repo(s)")
+        lines.append("")
+        if pulled_names:
+            lines.append("--- Repos pulled ---")
+            lines.extend(f"  • {n}" for n in sorted(pulled_names))
+            lines.append("")
+    if failed:
+        lines.append("--- Failed (check branch/remote) ---")
+        for name, err in sorted(failed, key=lambda x: x[0]):
+            lines.append(f"  • {name}")
+            lines.append(f"    {err}")
+    return "\n".join(lines)
+
+
+def maybe_notify_after_run(
+    config: dict,
+    sync_type: str,
+    output_dir: str = "",
+    cloned: int = 0,
+    pulled: int = 0,
+    cloned_names: list[str] | None = None,
+    pulled_names: list[str] | None = None,
+    failed: list[tuple[str, str]] | None = None,
+) -> None:
+    """If config has email notification set, send summary after sync or pull-only."""
+    cloned_names = cloned_names or []
+    pulled_names = pulled_names or []
+    failed = failed or []
+    body = build_notification_body(
+        sync_type, output_dir, cloned, pulled, cloned_names, pulled_names, failed
+    )
+    if sync_type == "sync":
+        subject = f"GithubClonerAgent sync done — {platform.node() or 'device'}"
+    else:
+        subject = f"GithubClonerAgent pull done — {platform.node() or 'device'}"
+    send_notification_email(config, subject, body)
 
 
 def clone_repo(
@@ -423,9 +602,10 @@ def sync_repos(
     url_key: str,
     shallow: bool,
     jobs: int,
-) -> tuple[int, int]:
-    """Clone missing repos and pull existing. Returns (cloned_count, pulled_count)."""
-    cloned, pulled = 0, 0
+) -> tuple[int, int, list[str], list[str], list[tuple[str, str]]]:
+    """Clone missing repos and pull existing. Returns (cloned, pulled, cloned_names, pulled_names, pull_failed)."""
+    cloned_names: list[str] = []
+    pulled_names: list[str] = []
     to_clone = []
     to_pull = []
     for r in repos:
@@ -436,28 +616,48 @@ def sync_repos(
         else:
             to_clone.append(r)
 
-    def do_clone(r_dict: dict) -> bool:
-        return clone_repo(r_dict[url_key], dest, url_key == "sshUrl", False, shallow, verbose_skip=False)
-
     if jobs <= 1:
         for r in to_clone:
-            if do_clone(r):
-                cloned += 1
+            if clone_repo(r[url_key], dest, url_key == "sshUrl", False, shallow, verbose_skip=False):
+                cloned_names.append(r["name"].split("/")[-1])
+    else:
+        def do_clone_with_name(r_dict: dict) -> str | None:
+            ok = clone_repo(
+                r_dict[url_key], dest, url_key == "sshUrl", False, shallow, verbose_skip=False
+            )
+            return (r_dict["name"].split("/")[-1]) if ok else None
+
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futures = [ex.submit(do_clone_with_name, r) for r in to_clone]
+            for fut in as_completed(futures):
+                name = fut.result()
+                if name:
+                    cloned_names.append(name)
+    cloned = len(cloned_names)
+
+    pull_failed: list[tuple[str, str]] = []
+    if jobs <= 1:
+        for path in to_pull:
+            name, ok, err = _pull_one(path)
+            if ok:
+                print(f"  pulled: {path}")
+                pulled_names.append(name)
+            else:
+                print(f"  failed: {path} ({err})", file=sys.stderr)
+                pull_failed.append((name, err))
     else:
         with ThreadPoolExecutor(max_workers=jobs) as ex:
-            futures = {ex.submit(do_clone, r): r for r in to_clone}
+            futures = {ex.submit(_pull_one, path): path for path in to_pull}
             for fut in as_completed(futures):
-                if fut.result():
-                    cloned += 1
-
-    for path in to_pull:
-        r = run_cmd(["git", "-C", path, "pull"], check=False)
-        if r.returncode == 0:
-            print(f"  pulled: {path}")
-            pulled += 1
-        else:
-            print(f"  failed: {path} ({r.stderr or r.stdout or 'pull failed'})", file=sys.stderr)
-    return cloned, pulled
+                name, ok, err = fut.result()
+                if ok:
+                    print(f"  pulled: {futures[fut]}")
+                    pulled_names.append(name)
+                else:
+                    print(f"  failed: {futures[fut]} ({err})", file=sys.stderr)
+                    pull_failed.append((name, err))
+    pulled = len(pulled_names)
+    return cloned, pulled, cloned_names, pulled_names, pull_failed
 
 
 def main() -> int:
@@ -591,8 +791,29 @@ def main() -> int:
         return run_status(dest, args.require_branch)
 
     if args.pull_only:
-        n = pull_all_repos(dest)
-        print(f"Pulled {n} repo(s).")
+        if not ensure_gh_ready():
+            return 1
+        try:
+            gh_repos = get_repo_list(
+                args.owner,
+                args.limit,
+                no_archived=args.no_archived,
+                exclude=exclude_list,
+                only=only_list,
+            )
+            only_names = {r["name"].split("/")[-1] for r in gh_repos}
+        except (subprocess.CalledProcessError, Exception) as e:
+            print(f"Could not get GitHub repo list: {e}", file=sys.stderr)
+            return 1
+        n, pulled_names, failed = pull_all_repos(
+            dest, max(1, args.jobs), only_repo_names=only_names
+        )
+        print(f"Pulled {n} repo(s) (only your GitHub repos).")
+        if failed:
+            print(f"Failed: {len(failed)} repo(s).", file=sys.stderr)
+        maybe_notify_after_run(
+            config, "pull", output_dir=dest, pulled=n, pulled_names=pulled_names, failed=failed
+        )
         return 0
 
     # From here we need repo list from GitHub (--list, --sync, or default clone)
@@ -630,8 +851,22 @@ def main() -> int:
     if args.sync:
         print(f"Sync target: {dest}")
         print("Fetching repository list from GitHub...")
-        cloned, pulled = sync_repos(repos, dest, url_key, args.shallow, max(1, args.jobs))
+        cloned, pulled, cloned_names, pulled_names, pull_failed = sync_repos(
+            repos, dest, url_key, args.shallow, max(1, args.jobs)
+        )
         print(f"Done: {cloned} cloned, {pulled} pulled.")
+        if pull_failed:
+            print(f"Failed: {len(pull_failed)} repo(s).", file=sys.stderr)
+        maybe_notify_after_run(
+            config,
+            "sync",
+            output_dir=dest,
+            cloned=cloned,
+            pulled=pulled,
+            cloned_names=cloned_names,
+            pulled_names=pulled_names,
+            failed=pull_failed,
+        )
         return 0
 
     # Default: clone only (no pull)

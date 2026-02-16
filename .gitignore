@@ -1,0 +1,6 @@
+# Keep credentials out of the repo
+config.json
+
+# Logs from scheduled sync
+sync.log
+pull.log

@@ -6,5 +6,12 @@
   "only": "",
   "shallow": false,
   "jobs": 1,
-  "require_branch": "main"
+  "require_branch": "main",
+  "notify_email": "",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "your@gmail.com",
+  "smtp_from": "",
+  "smtp_password": "",
+  "smtp_password_gist_raw_url": ""
 }
