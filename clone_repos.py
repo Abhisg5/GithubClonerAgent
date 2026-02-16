@@ -433,9 +433,15 @@ def build_notification_body(
     cloned_names: list[str],
     pulled_names: list[str],
     failed: list[tuple[str, str]] | None = None,
+    committed_names: list[str] | None = None,
+    prs: list[tuple[str, str]] | None = None,
+    commit_errors: list[tuple[str, str]] | None = None,
 ) -> str:
     """Build a descriptive email body for debugging."""
     failed = failed or []
+    committed_names = committed_names or []
+    prs = prs or []
+    commit_errors = commit_errors or []
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     device = get_device_info()
     lines = [
@@ -456,9 +462,13 @@ def build_notification_body(
             "--- Summary ---",
             f"Cloned: {cloned} repo(s)",
             f"Pulled: {pulled} repo(s)",
+            f"Committed (local changes → feature/date): {len(committed_names)} repo(s)",
+            f"PRs created: {len(prs)}",
         ])
         if failed:
-            lines.append(f"Failed: {len(failed)} repo(s)")
+            lines.append(f"Pull failed: {len(failed)} repo(s)")
+        if commit_errors:
+            lines.append(f"Commit/PR errors: {len(commit_errors)} repo(s)")
         lines.append("")
         if cloned_names:
             lines.append("--- Repos cloned ---")
@@ -467,6 +477,16 @@ def build_notification_body(
         if pulled_names:
             lines.append("--- Repos pulled ---")
             lines.extend(f"  • {n}" for n in sorted(pulled_names))
+            lines.append("")
+        if committed_names:
+            lines.append("--- Committed (pushed to feature/date branch) ---")
+            lines.extend(f"  • {n}" for n in sorted(committed_names))
+            lines.append("")
+        if prs:
+            lines.append("--- PRs created (feature/date → main) ---")
+            for name, url in sorted(prs, key=lambda x: x[0]):
+                lines.append(f"  • {name}")
+                lines.append(f"    {url}")
             lines.append("")
     else:
         lines.append("--- Summary ---")
@@ -479,8 +499,14 @@ def build_notification_body(
             lines.extend(f"  • {n}" for n in sorted(pulled_names))
             lines.append("")
     if failed:
-        lines.append("--- Failed (check branch/remote) ---")
+        lines.append("--- Pull failed (check branch/remote) ---")
         for name, err in sorted(failed, key=lambda x: x[0]):
+            lines.append(f"  • {name}")
+            lines.append(f"    {err}")
+        lines.append("")
+    if commit_errors:
+        lines.append("--- Commit/PR errors ---")
+        for name, err in sorted(commit_errors, key=lambda x: x[0]):
             lines.append(f"  • {name}")
             lines.append(f"    {err}")
     return "\n".join(lines)
@@ -495,13 +521,28 @@ def maybe_notify_after_run(
     cloned_names: list[str] | None = None,
     pulled_names: list[str] | None = None,
     failed: list[tuple[str, str]] | None = None,
+    committed_names: list[str] | None = None,
+    prs: list[tuple[str, str]] | None = None,
+    commit_errors: list[tuple[str, str]] | None = None,
 ) -> None:
     """If config has email notification set, send summary after sync or pull-only."""
     cloned_names = cloned_names or []
     pulled_names = pulled_names or []
     failed = failed or []
+    committed_names = committed_names or []
+    prs = prs or []
+    commit_errors = commit_errors or []
     body = build_notification_body(
-        sync_type, output_dir, cloned, pulled, cloned_names, pulled_names, failed
+        sync_type,
+        output_dir,
+        cloned,
+        pulled,
+        cloned_names,
+        pulled_names,
+        failed,
+        committed_names=committed_names,
+        prs=prs,
+        commit_errors=commit_errors,
     )
     if sync_type == "sync":
         subject = f"GithubClonerAgent sync done — {platform.node() or 'device'}"
@@ -572,9 +613,15 @@ def repo_status(path: str, require_branch: str | None) -> dict | None:
         return {"path": path, "branch": "?", "ahead": 0, "behind": 0, "dirty": False, "error": str(e)}
 
 
-def run_status(output_dir: str, require_branch: str | None) -> int:
-    """Print status (branch, ahead/behind, dirty) for each repo. Return 0."""
+def run_status(
+    output_dir: str,
+    require_branch: str | None,
+    only_repo_names: set[str] | None = None,
+) -> int:
+    """Print status (branch, ahead/behind, dirty) for each repo. If only_repo_names is set, only those repos (from your GitHub list). Return 0."""
     repos = find_repo_dirs(output_dir)
+    if only_repo_names is not None:
+        repos = [p for p in repos if os.path.basename(p) in only_repo_names]
     if not repos:
         print("No git repositories found.")
         return 0
@@ -658,6 +705,90 @@ def sync_repos(
                     pull_failed.append((name, err))
     pulled = len(pulled_names)
     return cloned, pulled, cloned_names, pulled_names, pull_failed
+
+
+def _commit_and_pr_one(repo_path: str, date_str: str) -> tuple[str, bool, str | None, str | None]:
+    """
+    If repo has local changes: create/checkout feature/date, commit, push, create PR.
+    Returns (repo_name, committed, pr_url, error). pr_url and error are None on success.
+    """
+    name = os.path.basename(repo_path)
+    branch = f"feature/{date_str}"
+    try:
+        r = run_cmd(["git", "-C", repo_path, "status", "--porcelain"], check=False)
+        if not r.stdout.strip():
+            return (name, False, None, None)  # no changes
+
+        # Create or checkout feature/date branch
+        check = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "--verify", branch],
+            capture_output=True,
+            text=True,
+        )
+        if check.returncode == 0:
+            run_cmd(["git", "-C", repo_path, "checkout", branch])
+        else:
+            run_cmd(["git", "-C", repo_path, "checkout", "-b", branch])
+
+        run_cmd(["git", "-C", repo_path, "add", "-A"])
+        r2 = run_cmd(["git", "-C", repo_path, "status", "--porcelain"], check=False)
+        if not r2.stdout.strip():
+            return (name, False, None, None)  # nothing to commit after add (e.g. only untracked that were ignored)
+
+        run_cmd(
+            ["git", "-C", repo_path, "commit", "-m", f"Auto-sync from GithubClonerAgent ({date_str})"]
+        )
+        run_cmd(["git", "-C", repo_path, "push", "-u", "origin", branch])
+
+        # Create PR (run from repo so gh detects it)
+        pr_result = subprocess.run(
+            [
+                "gh", "pr", "create",
+                "--base", "main",
+                "--head", branch,
+                "--title", f"Auto-sync {date_str}",
+                "--body", "Automated sync from GithubClonerAgent.",
+            ],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        pr_url = pr_result.stdout.strip() if pr_result.returncode == 0 else None
+        if pr_result.returncode != 0 and "already exists" not in (pr_result.stderr or "").lower():
+            return (name, True, pr_url, (pr_result.stderr or pr_result.stdout or "PR create failed")[:200])
+        return (name, True, pr_url, None)
+    except subprocess.CalledProcessError as e:
+        return (name, False, None, (e.stderr or e.stdout or str(e))[:200])
+    except Exception as e:
+        return (name, False, None, str(e)[:200])
+
+
+def commit_and_push_changes(
+    dest: str, repo_names: set[str], date_str: str
+) -> tuple[list[str], list[tuple[str, str]], list[tuple[str, str]]]:
+    """
+    For each repo in dest that has local changes: commit to feature/date, push, create PR.
+    Returns (committed_names, list of (name, pr_url), list of (name, error)).
+    """
+    committed: list[str] = []
+    prs: list[tuple[str, str]] = []
+    errors: list[tuple[str, str]] = []
+    for name in sorted(repo_names):
+        path = os.path.join(dest, name)
+        if not os.path.isdir(path) or not os.path.isdir(os.path.join(path, ".git")):
+            continue
+        repo_name, did_commit, pr_url, err = _commit_and_pr_one(path, date_str)
+        if err:
+            errors.append((repo_name, err))
+            print(f"  commit/PR error {repo_name}: {err}", file=sys.stderr)
+        elif did_commit:
+            committed.append(repo_name)
+            if pr_url:
+                prs.append((repo_name, pr_url))
+                print(f"  committed & PR: {repo_name} -> {pr_url}")
+            else:
+                print(f"  committed & pushed: {repo_name}")
+    return committed, prs, errors
 
 
 def main() -> int:
@@ -788,7 +919,21 @@ def main() -> int:
         return 0 if clear_schedule() else 1
 
     if args.status:
-        return run_status(dest, args.require_branch)
+        if not ensure_gh_ready():
+            return 1
+        try:
+            gh_repos = get_repo_list(
+                args.owner,
+                args.limit,
+                no_archived=args.no_archived,
+                exclude=exclude_list,
+                only=only_list,
+            )
+            only_names = {r["name"].split("/")[-1] for r in gh_repos}
+        except (subprocess.CalledProcessError, Exception) as e:
+            print(f"Could not get GitHub repo list: {e}", file=sys.stderr)
+            return 1
+        return run_status(dest, args.require_branch, only_repo_names=only_names)
 
     if args.pull_only:
         if not ensure_gh_ready():
@@ -857,6 +1002,19 @@ def main() -> int:
         print(f"Done: {cloned} cloned, {pulled} pulled.")
         if pull_failed:
             print(f"Failed: {len(pull_failed)} repo(s).", file=sys.stderr)
+        # Commit local changes to feature/date and create PRs (only when not dry-run)
+        committed_names: list[str] = []
+        prs: list[tuple[str, str]] = []
+        commit_errors: list[tuple[str, str]] = []
+        if not args.dry_run:
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            repo_names = {r["name"].split("/")[-1] for r in repos}
+            print("Checking for local changes to commit and open PRs...")
+            committed_names, prs, commit_errors = commit_and_push_changes(dest, repo_names, date_str)
+            if committed_names:
+                print(f"Committed: {len(committed_names)} repo(s). PRs created: {len(prs)}.")
+            if commit_errors:
+                print(f"Commit/PR errors: {len(commit_errors)} repo(s).", file=sys.stderr)
         maybe_notify_after_run(
             config,
             "sync",
@@ -866,6 +1024,9 @@ def main() -> int:
             cloned_names=cloned_names,
             pulled_names=pulled_names,
             failed=pull_failed,
+            committed_names=committed_names,
+            prs=prs,
+            commit_errors=commit_errors,
         )
         return 0
 

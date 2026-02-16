@@ -1,151 +1,150 @@
 # GithubClonerAgent
 
-Clone and sync all your GitHub repositories into one folder (default: **Programming**, parent of `GithubClonerAgent`). Cross-platform (macOS and Windows). The scheduled job runs a **full sync** at 2 AM EST: clone any new repos and pull existing ones so everything stays updated across machines.
+Keep all your GitHub repos in one folder, in sync across machines. Clone missing repos, pull existing ones, and optionally commit local changes to a `feature/YYYY-MM-DD` branch and open a PR to `main`. Runs on **macOS and Windows**; supports a daily 2 AM EST job and email summaries.
+
+**All commands operate only on repos from your GitHub account** (via `gh repo list`). Other folders in the output directory (e.g. local-only projects) are ignored.
+
+---
 
 ## Requirements
 
-- **Python 3.8+** (usually pre-installed on macOS; on Windows install from [python.org](https://www.python.org/downloads/))
-- **GitHub CLI (`gh`)** — [Install guide](https://cli.github.com/) (script will prompt to install or log in)
-- **Git** — [Install guide](https://git-scm.com/)
+- **Python 3.8+**
+- **Git**
+- **GitHub CLI (`gh`)** — [cli.github.com](https://cli.github.com/)  
+  The script will prompt you to install or log in if needed.
 
-## Usage
+---
+
+## Quick start
 
 ```bash
 cd GithubClonerAgent
-
-# Sync: clone any missing repos + pull existing (what the 2 AM job runs)
 python clone_repos.py --sync
-
-# First-time clone only (no pull)
-python clone_repos.py
-
-# List repos from GitHub (with your filters), no clone
-python clone_repos.py --list
-
-# Status: branch, ahead/behind, dirty for each repo
-python clone_repos.py --status
-
-# Dry run: show what would be cloned
-python clone_repos.py --dry-run
-
-# Set up daily 2 AM EST sync (clone new + pull existing)
-python clone_repos.py --setup-schedule
-
-# Remove the scheduled task or cron job
-python clone_repos.py --clear-schedule
-
-# Pull only (no new clones, no gh needed)
-python clone_repos.py --pull-only
 ```
 
-**Default location:** Repos go in the **Programming** folder. Override with `-o path` or a `config.json` (see below).
+This clones any repos you don’t have yet, pulls the rest, and for any repo with uncommitted changes: creates `feature/YYYY-MM-DD`, commits, pushes, and opens a PR to `main`. Repos are placed in the **Programming** folder (parent of `GithubClonerAgent`) unless you set `-o` or `config.json`.
 
-### Options
+---
+
+## Commands
+
+| Command | What it does |
+|--------|----------------|
+| `python clone_repos.py --sync` | Clone missing repos, pull existing, then commit local changes to `feature/date` and open PRs. Same as the 2 AM job. |
+| `python clone_repos.py` | Clone-only: fetch repo list and clone any missing (no pull, no commit/PR). |
+| `python clone_repos.py --pull-only` | Pull only in repos that are in your GitHub list (no clone, no commit/PR). |
+| `python clone_repos.py --status` | Show branch, ahead/behind, and dirty state for each repo in your GitHub list. |
+| `python clone_repos.py --list` | Print repo names from GitHub (with your filters). No disk changes. |
+| `python clone_repos.py --dry-run` | Show what would be cloned; no clone/pull/commit. |
+| `python clone_repos.py --setup-schedule` | Install daily 2 AM EST task (clone + pull + commit/PR). |
+| `python clone_repos.py --clear-schedule` | Remove the 2 AM scheduled task or cron job. |
+
+---
+
+## Options
 
 | Option | Description |
 |--------|-------------|
-| `--sync` | Clone missing repos and pull existing (default for scheduled job) |
-| `--list` | List repo names from GitHub (with filters); no clone/pull |
-| `--status` | Show branch, ahead/behind, dirty for each repo in output dir |
-| `--dry-run` | Show what would be cloned; no `git clone` |
-| `--pull-only` | Only `git pull` in existing repos (no clone, no gh) |
-| `--setup-schedule` | Install daily 2 AM EST **sync** (clone new + pull) |
-| `--clear-schedule` | Remove the scheduled task or cron job |
-| `-o`, `--output-dir` | Clone/sync directory (default: config or Programming folder) |
-| `--owner USER` | List repos for this user/org |
-| `-n`, `--limit N` | Max repos to fetch (default: 1000) |
-| `--no-archived` | Skip archived repositories |
-| `--exclude PATTERNS` | Comma-separated globs to exclude (e.g. `old-*,deprecated-*`) |
-| `--only PATTERNS` | Comma-separated globs to include only (e.g. `my-*`) |
-| `--shallow` | Clone with `--depth 1` for faster first clone |
-| `--jobs N` | Parallel clone jobs (default: 1) |
-| `--require-branch BRANCH` | In `--status`, warn when repo is not on this branch (e.g. `main`) |
-| `--ssh` | Use SSH clone URLs |
+| `-o`, `--output-dir PATH` | Where to clone/pull (default: parent of `GithubClonerAgent`, or `config.json`). |
+| `--owner USER` | List repos for this user/org (default: you). |
+| `-n`, `--limit N` | Max repos to consider (default: 1000). |
+| `--no-archived` | Skip archived repos. |
+| `--exclude PATTERNS` | Comma-separated globs to exclude (e.g. `old-*,deprecated-*`). |
+| `--only PATTERNS` | Comma-separated globs to include only (e.g. `my-*`). |
+| `--shallow` | Clone with `--depth 1`. |
+| `--jobs N` | Parallel clone/pull jobs (default: 1). |
+| `--require-branch BRANCH` | In `--status`, warn when repo is not on this branch (e.g. `main`). |
+| `--ssh` | Use SSH clone URLs. |
 
-## Email notification (Mac and Windows)
+---
 
-When the 2 AM sync (or a manual `--sync` / `--pull-only`) finishes, you can get an email with a short summary (e.g. *"Cloned: 2, Pulled: 15"*). Same behavior on **macOS and Windows**.
+## 2 AM scheduled job
 
-1. Copy `config.example.json` to `config.json`.
-2. Set **notify_email**, **smtp_host**, **smtp_port**, **smtp_user**. For the password, use one of: **smtp_password** in the file, env var **GITHUB_CLONER_AGENT_SMTP_PASSWORD**, or **smtp_password_gist_raw_url** (see below) so the script fetches it from a secret gist at runtime.
-3. Run `--setup-schedule` as usual. The scheduled job reads `config.json`; when it finishes, it sends the email if SMTP is configured.
+The scheduled run does a **full sync**:
 
-**Example (Gmail):** Use an [App Password](https://support.google.com/accounts/answer/185833) (not your normal password). In `config.json`: `smtp_host`: `smtp.gmail.com`, `smtp_port`: `587`, `smtp_user`: your Gmail, `notify_email`: the address to receive the summary (can be the same), and put the app password in `smtp_password` or in `GITHUB_CLONER_AGENT_SMTP_PASSWORD`.
+1. **Clone** any repos you don’t have locally.
+2. **Pull** all existing repos from your GitHub list.
+3. **Commit & PR:** For each repo with uncommitted changes, create branch `feature/YYYY-MM-DD`, commit all changes, push, and open a PR into `main`. Repos with no changes are left alone.
+4. **Email** (if configured): send a summary (cloned, pulled, committed, PR links, errors).
 
-## Config file
+- **Windows:** Task runs at **2:00 AM** local time. Set timezone to Eastern for 2 AM EST.  
+  Task name: `GithubClonerAgent-daily-pull`.
+- **macOS:** Cron at **7:00 UTC** (= 2 AM Eastern). Log: `GithubClonerAgent/sync.log`.
 
-Optional `config.json` in the `GithubClonerAgent` folder sets defaults (CLI flags still override):
-
-```json
-{
-  "output_dir": "/path/to/repos",
-  "limit": 1000,
-  "no_archived": true,
-  "exclude": "old-*,deprecated-*",
-  "only": "",
-  "shallow": false,
-  "jobs": 2,
-  "require_branch": "main",
-  "notify_email": "you@example.com",
-  "smtp_host": "smtp.gmail.com",
-  "smtp_port": 587,
-  "smtp_user": "your@gmail.com",
-  "smtp_from": "",
-  "smtp_password": "",
-  "smtp_password_gist_raw_url": ""
-}
-```
-
-- **smtp_password:** Leave empty if you use the env var or gist.
-- **GITHUB_CLONER_AGENT_SMTP_PASSWORD:** Set in the environment to supply the password without putting it in the file.
-- **smtp_password_gist_raw_url:** Optional. The **Raw** URL of a secret gist whose only content is the app password (e.g. `https://gist.githubusercontent.com/USER/GIST_ID/raw/gistfile1.txt`). The script fetches it at runtime so you don’t set the env var on each machine. Keep this URL only in `config.json` (never commit it). Copy `config.example.json` to `config.json` and edit.
-
-### Keeping the SMTP password secret (public repo + multiple computers)
-
-The repo can stay **public** and your app password stays **private**:
-
-1. **Never commit the password.**  
-   `config.json` is in `.gitignore`, so it never gets pushed. In `config.json`, leave `smtp_password` empty (`""`).
-
-2. **Use the environment variable.**  
-   Set your app password in **GITHUB_CLONER_AGENT_SMTP_PASSWORD** (not in any file). The script reads it at runtime.
-
-3. **Store the password and use it on each computer:**
-   - **Option A – Gist (auto-fetch):** Put the app password in a **secret gist** (one file, content = password only). In `config.json` set **smtp_password_gist_raw_url** to that gist’s **Raw** URL (e.g. `https://gist.githubusercontent.com/USER/GIST_ID/raw/filename.txt`). The script will fetch the password from the gist when it runs. No env var needed. Keep the URL only in `config.json` (gitignored); never commit it.
-   - **Option B – Env var:** Set **GITHUB_CLONER_AGENT_SMTP_PASSWORD** on each machine. Store the password in a password manager or a private gist and copy it when setting up a new computer.
-
-4. **Set the env var on each machine** so the script (and the 2 AM scheduled task) can use it:
-   - **Windows:**  
-     `System Properties` → `Advanced` → `Environment Variables` → under “User variables” add `GITHUB_CLONER_AGENT_SMTP_PASSWORD` = your app password.  
-     Or in PowerShell (current user, persistent):  
-     `[System.Environment]::SetEnvironmentVariable('GITHUB_CLONER_AGENT_SMTP_PASSWORD', 'your-app-password', 'User')`  
-     Restart the terminal (and ensure the scheduled task runs as the same user so it sees the variable).
-   - **macOS:**  
-     Add to `~/.zshrc` or `~/.bash_profile`:  
-     `export GITHUB_CLONER_AGENT_SMTP_PASSWORD='your-app-password'`  
-     Then `source ~/.zshrc` (or reopen the terminal). Cron runs with your user, so it will see this if you use a login shell or set it in your profile.
-
-After that you can push the repo to GitHub as public; the app password only exists in your env and in your private gist or password manager.
-
-## Scheduled sync (2 AM EST)
-
-The scheduled job runs **full sync**: clone any new repos and pull all existing ones so everything is up to date when you switch computers.
-
-- **Windows:** Task runs daily at **2:00 AM** local time. Set timezone to Eastern for 2 AM EST.
-- **macOS:** Cron runs at **7:00 UTC** (= 2 AM Eastern). Log: `GithubClonerAgent/sync.log`.
-
-Setup once per machine:
+**Setup (once per machine):**
 
 ```bash
 python clone_repos.py --setup-schedule
 ```
 
-- **Windows:** Task name `GithubClonerAgent-daily-pull`. Remove: `python clone_repos.py --clear-schedule` or `schtasks /delete /tn GithubClonerAgent-daily-pull /f`
-- **macOS:** Remove: `python clone_repos.py --clear-schedule` or `crontab -e`
+**Remove:**
 
-## Mac vs Windows
+```bash
+python clone_repos.py --clear-schedule
+```
 
-- **macOS:** `python3 clone_repos.py` (or `python` if Python 3).
-- **Windows:** `python clone_repos.py` or `py clone_repos.py`.
+Or: **Windows** — `schtasks /delete /tn GithubClonerAgent-daily-pull /f`  
+**macOS** — `crontab -e` and delete the line with `clone_repos.py --sync`.
 
-Existing repos are skipped when cloning; `--sync` updates them with `git pull`.
+---
+
+## Config file
+
+Copy `config.example.json` to `config.json` in the `GithubClonerAgent` folder. CLI flags override config.
+
+| Key | Description |
+|-----|-------------|
+| `output_dir` | Default clone/pull directory (empty = parent of `GithubClonerAgent`). |
+| `limit` | Max repos (default 1000). |
+| `no_archived` | Skip archived repos. |
+| `exclude` | Comma-separated globs to exclude. |
+| `only` | Comma-separated globs to include only. |
+| `shallow` | Use shallow clone. |
+| `jobs` | Parallel clone/pull jobs. |
+| `require_branch` | Branch to warn about in `--status` (e.g. `main`). |
+| `notify_email` | Email address to receive run summaries. |
+| `smtp_host`, `smtp_port`, `smtp_user` | SMTP server (e.g. Gmail: `smtp.gmail.com`, 587). |
+| `smtp_from` | From address (default: `smtp_user`). |
+| `smtp_password` | Leave empty if using env or gist (see below). |
+| `smtp_password_gist_raw_url` | Raw URL of a **secret gist** whose only content is the SMTP app password; script fetches it at runtime. |
+
+`config.json` is in `.gitignore` and is never committed.
+
+---
+
+## Email notification
+
+After a **sync** or **pull-only** run, the script can send one email with:
+
+- Device (hostname, OS, user)
+- Time (UTC)
+- Output directory
+- Counts: cloned, pulled, committed, PRs created, failed
+- Lists: repos cloned, pulled, committed, PR URLs, pull/commit errors
+
+**Setup:**
+
+1. In `config.json`: set `notify_email`, `smtp_host`, `smtp_port`, `smtp_user`.
+2. For the password, use **one** of:
+   - **Gist:** Put the app password in a **secret gist** (one file, content = password). Set `smtp_password_gist_raw_url` to that gist’s **Raw** URL. The script fetches it when it runs. Keep the URL only in `config.json` (do not commit).
+   - **Env var:** Set `GITHUB_CLONER_AGENT_SMTP_PASSWORD` in the environment. No password in any file.
+   - **File:** Set `smtp_password` in `config.json` (not recommended if the repo is public).
+
+**Gmail:** Use an [App Password](https://support.google.com/accounts/answer/185833) with 2FA. `smtp_host`: `smtp.gmail.com`, `smtp_port`: `587`.
+
+---
+
+## Keeping the SMTP password secret (public repo)
+
+- **Do not commit** `config.json` (it’s gitignored).
+- Prefer **`smtp_password_gist_raw_url`** (secret gist) or **`GITHUB_CLONER_AGENT_SMTP_PASSWORD`** so the password is never in the repo.
+- On each new machine: copy `config.example.json` to `config.json`, fill in options and (if you use it) the gist URL. For env var: set `GITHUB_CLONER_AGENT_SMTP_PASSWORD` in the system/user environment so the 2 AM task can use it.
+
+---
+
+## Platform
+
+- **Windows:** `python clone_repos.py` or `py clone_repos.py`
+- **macOS:** `python3 clone_repos.py` or `python clone_repos.py`
+
+Schedule and email work the same on both; only the 2 AM trigger differs (Task Scheduler vs cron).
