@@ -1,0 +1,10 @@
+{
+  "output_dir": "",
+  "limit": 1000,
+  "no_archived": false,
+  "exclude": "old-*,deprecated-*",
+  "only": "",
+  "shallow": false,
+  "jobs": 1,
+  "require_branch": "main"
+}

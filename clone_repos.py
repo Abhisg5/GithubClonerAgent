@@ -5,11 +5,13 @@ Works on macOS and Windows. Requires GitHub CLI (gh) to be installed and authent
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import subprocess
 import sys
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 GH_INSTALL_URL = "https://cli.github.com/"
 TASK_NAME = "GithubClonerAgent-daily-pull"
@@ -17,6 +19,7 @@ TASK_NAME = "GithubClonerAgent-daily-pull"
 CRON_TIME_UTC = "7"  # hour for 0 7 * * *
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = "config.json"
 
 
 def get_default_output_dir() -> str:
@@ -100,18 +103,63 @@ def ensure_gh_ready() -> bool:
     return True
 
 
-def get_repo_list(owner: str | None, limit: int) -> list[dict]:
-    """Fetch list of repos via gh repo list. Returns list of {owner/name, clone_url}."""
-    # gh repo list [owner] --limit N --json nameWithOwner,url,sshUrl
-    args = ["gh", "repo", "list", "--limit", str(limit), "--json", "nameWithOwner,url,sshUrl"]
+def load_config() -> dict:
+    """Load optional config.json from script dir. Returns dict of options (empty if missing)."""
+    path = os.path.join(SCRIPT_DIR, CONFIG_FILE)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def apply_filters(
+    repos: list[dict],
+    exclude: list[str],
+    only: list[str],
+) -> list[dict]:
+    """Filter repos by --exclude and --only glob patterns on nameWithOwner."""
+    out = []
+    for r in repos:
+        name = r["name"]
+        if only:
+            if not any(fnmatch.fnmatch(name, p.strip()) for p in only):
+                continue
+        if exclude:
+            if any(fnmatch.fnmatch(name, p.strip()) for p in exclude):
+                continue
+        out.append(r)
+    return out
+
+
+def get_repo_list(
+    owner: str | None,
+    limit: int,
+    no_archived: bool = False,
+    exclude: list[str] | None = None,
+    only: list[str] | None = None,
+) -> list[dict]:
+    """Fetch list of repos via gh repo list. Returns list of {name, url, sshUrl}."""
+    json_fields = "nameWithOwner,url,sshUrl"
+    if no_archived:
+        json_fields += ",isArchived"
+    args = ["gh", "repo", "list", "--limit", str(limit), "--json", json_fields]
     if owner:
         args.insert(3, owner)
     result = run_cmd(args)
     data = json.loads(result.stdout)
-    return [
-        {"name": r["nameWithOwner"], "url": r["url"], "sshUrl": r.get("sshUrl", r["url"])}
-        for r in data
-    ]
+    repos = []
+    for r in data:
+        if no_archived and r.get("isArchived"):
+            continue
+        repos.append({
+            "name": r["nameWithOwner"],
+            "url": r["url"],
+            "sshUrl": r.get("sshUrl", r["url"]),
+        })
+    return apply_filters(repos, exclude or [], only or [])
 
 
 def find_repo_dirs(output_dir: str) -> list[str]:
@@ -148,10 +196,10 @@ def pull_all_repos(output_dir: str) -> int:
 
 
 def setup_schedule_windows(output_dir: str) -> bool:
-    """Create Windows scheduled task: daily at 2 AM (local time)."""
+    """Create Windows scheduled task: daily at 2 AM (local time). Runs full sync (clone new + pull)."""
     python_exe = sys.executable
     script_py = os.path.join(SCRIPT_DIR, "clone_repos.py")
-    cmd = f'"{python_exe}" "{script_py}" --pull-only -o "{output_dir}"'
+    cmd = f'"{python_exe}" "{script_py}" --sync -o "{output_dir}"'
     # Run at 2:00 AM local time (user should set timezone to Eastern for 2 AM EST)
     try:
         subprocess.run(
@@ -174,12 +222,12 @@ def setup_schedule_windows(output_dir: str) -> bool:
 
 
 def setup_schedule_mac(output_dir: str) -> bool:
-    """Add cron job: daily at 2 AM EST (7 AM UTC)."""
+    """Add cron job: daily at 2 AM EST (7 AM UTC). Runs full sync (clone new + pull)."""
     python_exe = sys.executable
     script_py = os.path.join(SCRIPT_DIR, "clone_repos.py")
-    log_file = os.path.join(SCRIPT_DIR, "pull.log")
+    log_file = os.path.join(SCRIPT_DIR, "sync.log")
     # 0 7 * * * = 7:00 UTC = 2 AM EST
-    cron_cmd = f'{python_exe} "{script_py}" --pull-only -o "{output_dir}" >> "{log_file}" 2>&1'
+    cron_cmd = f'{python_exe} "{script_py}" --sync -o "{output_dir}" >> "{log_file}" 2>&1'
     cron_line = f"0 7 * * * {cron_cmd}"
     try:
         result = subprocess.run(
@@ -188,8 +236,8 @@ def setup_schedule_mac(output_dir: str) -> bool:
             text=True,
         )
         existing = result.stdout if result.returncode == 0 else ""
-        # Avoid duplicate
-        if TASK_NAME in existing or "clone_repos.py" in existing and "--pull-only" in existing:
+        # Avoid duplicate (match --sync or legacy --pull-only)
+        if TASK_NAME in existing or ("clone_repos.py" in existing and ("--sync" in existing or "--pull-only" in existing)):
             print("Cron entry already present.")
             return True
         new_crontab = (existing.rstrip() + "\n" + cron_line + "\n").lstrip()
@@ -248,7 +296,10 @@ def clear_schedule_mac() -> bool:
         )
         existing = result.stdout if result.returncode == 0 else ""
         marker = "clone_repos.py"
-        new_lines = [line for line in existing.splitlines() if marker not in line or "--pull-only" not in line]
+        new_lines = [
+            line for line in existing.splitlines()
+            if marker not in line or ("--sync" not in line and "--pull-only" not in line)
+        ]
         new_crontab = "\n".join(new_lines)
         if new_crontab.rstrip() != existing.rstrip():
             subprocess.run(
@@ -280,17 +331,29 @@ def clear_schedule() -> bool:
     return False
 
 
-def clone_repo(url: str, dest_dir: str, use_ssh: bool, dry_run: bool) -> bool:
-    """Clone a single repo. Returns True on success."""
+def clone_repo(
+    url: str,
+    dest_dir: str,
+    use_ssh: bool,
+    dry_run: bool,
+    shallow: bool = False,
+    verbose_skip: bool = False,
+) -> bool:
+    """Clone a single repo. Returns True on success or skip."""
     if dry_run:
         print(f"  [dry run] would clone: {url} -> {dest_dir}")
         return True
     target = os.path.join(dest_dir, os.path.basename(url).replace(".git", ""))
     if os.path.isdir(target):
-        print(f"  skip (exists): {target}")
+        if verbose_skip:
+            print(f"  skip (exists): {target}")
         return True
     try:
-        run_cmd(["git", "clone", url, target])
+        cmd = ["git", "clone"]
+        if shallow:
+            cmd.extend(["--depth", "1"])
+        cmd.extend([url, target])
+        run_cmd(cmd)
         print(f"  cloned: {target}")
         return True
     except subprocess.CalledProcessError as e:
@@ -298,9 +361,108 @@ def clone_repo(url: str, dest_dir: str, use_ssh: bool, dry_run: bool) -> bool:
         return False
 
 
+def repo_status(path: str, require_branch: str | None) -> dict | None:
+    """Return dict with branch, ahead, behind, dirty for one repo, or None on error."""
+    try:
+        branch_r = run_cmd(["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        if branch_r.returncode != 0:
+            return {"path": path, "branch": "?", "ahead": 0, "behind": 0, "dirty": False, "error": "not a branch"}
+        branch = branch_r.stdout.strip()
+        dirty_r = run_cmd(["git", "-C", path, "status", "--porcelain"], check=False)
+        dirty = bool(dirty_r.stdout.strip())
+        ahead, behind = 0, 0
+        try:
+            count_r = run_cmd(
+                ["git", "-C", path, "rev-list", "--left-right", "--count", "@{u}...HEAD"],
+                check=False,
+            )
+            if count_r.returncode == 0 and count_r.stdout.strip():
+                behind_s, ahead_s = count_r.stdout.split()
+                behind, ahead = int(behind_s), int(ahead_s)
+        except (ValueError, IndexError):
+            pass
+        return {
+            "path": path,
+            "branch": branch,
+            "ahead": ahead,
+            "behind": behind,
+            "dirty": dirty,
+            "warn_branch": bool(require_branch and branch != require_branch),
+        }
+    except Exception as e:
+        return {"path": path, "branch": "?", "ahead": 0, "behind": 0, "dirty": False, "error": str(e)}
+
+
+def run_status(output_dir: str, require_branch: str | None) -> int:
+    """Print status (branch, ahead/behind, dirty) for each repo. Return 0."""
+    repos = find_repo_dirs(output_dir)
+    if not repos:
+        print("No git repositories found.")
+        return 0
+    for path in repos:
+        info = repo_status(path, require_branch)
+        if not info:
+            continue
+        name = os.path.basename(path)
+        branch = info.get("branch", "?")
+        ahead = info.get("ahead", 0)
+        behind = info.get("behind", 0)
+        dirty = "dirty" if info.get("dirty") else "clean"
+        line = f"  {name}: {branch}  (ahead {ahead}, behind {behind}) {dirty}"
+        if info.get("warn_branch") and require_branch:
+            line += f"  [not {require_branch}]"
+        if info.get("error"):
+            line += f"  ({info['error']})"
+        print(line)
+    return 0
+
+
+def sync_repos(
+    repos: list[dict],
+    dest: str,
+    url_key: str,
+    shallow: bool,
+    jobs: int,
+) -> tuple[int, int]:
+    """Clone missing repos and pull existing. Returns (cloned_count, pulled_count)."""
+    cloned, pulled = 0, 0
+    to_clone = []
+    to_pull = []
+    for r in repos:
+        name = r["name"].split("/")[-1]
+        path = os.path.join(dest, name)
+        if os.path.isdir(path) and os.path.isdir(os.path.join(path, ".git")):
+            to_pull.append(path)
+        else:
+            to_clone.append(r)
+
+    def do_clone(r_dict: dict) -> bool:
+        return clone_repo(r_dict[url_key], dest, url_key == "sshUrl", False, shallow, verbose_skip=False)
+
+    if jobs <= 1:
+        for r in to_clone:
+            if do_clone(r):
+                cloned += 1
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futures = {ex.submit(do_clone, r): r for r in to_clone}
+            for fut in as_completed(futures):
+                if fut.result():
+                    cloned += 1
+
+    for path in to_pull:
+        r = run_cmd(["git", "-C", path, "pull"], check=False)
+        if r.returncode == 0:
+            print(f"  pulled: {path}")
+            pulled += 1
+        else:
+            print(f"  failed: {path} ({r.stderr or r.stdout or 'pull failed'})", file=sys.stderr)
+    return cloned, pulled
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Clone all your GitHub repos. Requires 'gh' CLI (gh auth login)."
+        description="Clone/sync all your GitHub repos. Requires 'gh' CLI (gh auth login)."
     )
     parser.add_argument(
         "--dry-run",
@@ -308,24 +470,40 @@ def main() -> int:
         help="Only print what would be cloned; do not run git clone.",
     )
     parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_repos",
+        help="List repos from GitHub (with filters) and exit. No clone/pull.",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show branch, ahead/behind, and dirty state for each repo in output dir.",
+    )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Clone any missing repos and pull existing ones (default for scheduled job).",
+    )
+    parser.add_argument(
         "--pull-only",
         action="store_true",
-        help="Only run 'git pull' in all repos under output dir (no clone).",
+        help="Only run 'git pull' in all repos under output dir (no clone, no gh).",
     )
     parser.add_argument(
         "--setup-schedule",
         action="store_true",
-        help="Install daily scheduled task to pull all repos at 2 AM EST.",
+        help="Install daily task at 2 AM EST to run --sync (clone new + pull existing).",
     )
     parser.add_argument(
         "--clear-schedule",
         action="store_true",
-        help="Remove the daily pull scheduled task or cron job.",
+        help="Remove the daily scheduled task or cron job.",
     )
     parser.add_argument(
         "-o", "--output-dir",
         default=None,
-        help="Directory to clone/pull repos (default: Programming folder, parent of GithubClonerAgent).",
+        help="Directory to clone/pull repos (default: from config or Programming folder).",
     )
     parser.add_argument(
         "--owner",
@@ -335,8 +513,43 @@ def main() -> int:
     parser.add_argument(
         "-n", "--limit",
         type=int,
-        default=1000,
+        default=None,
         help="Max number of repos to fetch (default: 1000).",
+    )
+    parser.add_argument(
+        "--no-archived",
+        action="store_true",
+        help="Skip archived repositories.",
+    )
+    parser.add_argument(
+        "--exclude",
+        default=None,
+        metavar="PATTERNS",
+        help="Comma-separated globs to exclude (e.g. 'old-*,deprecated-*').",
+    )
+    parser.add_argument(
+        "--only",
+        default=None,
+        metavar="PATTERNS",
+        help="Comma-separated globs to include only (e.g. 'my-*').",
+    )
+    parser.add_argument(
+        "--shallow",
+        action="store_true",
+        help="Clone with --depth 1 for faster first clone.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of parallel clone jobs (default: 1).",
+    )
+    parser.add_argument(
+        "--require-branch",
+        default=None,
+        metavar="BRANCH",
+        help="Warn in --status when a repo is not on this branch (e.g. main).",
     )
     parser.add_argument(
         "--ssh",
@@ -345,7 +558,28 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Config file overrides defaults (cli still overrides config)
+    config = load_config()
+    if args.output_dir is None and config.get("output_dir"):
+        args.output_dir = config["output_dir"]
+    if args.limit is None:
+        args.limit = config.get("limit", 1000)
+    if not args.no_archived and config.get("no_archived"):
+        args.no_archived = True
+    if args.exclude is None and config.get("exclude"):
+        args.exclude = config["exclude"] if isinstance(config["exclude"], str) else ",".join(config["exclude"])
+    if args.only is None and config.get("only"):
+        args.only = config["only"] if isinstance(config["only"], str) else ",".join(config.get("only", []))
+    if not args.shallow and config.get("shallow"):
+        args.shallow = True
+    if args.jobs == 1 and config.get("jobs"):
+        args.jobs = int(config["jobs"])
+    if args.require_branch is None and config.get("require_branch"):
+        args.require_branch = config["require_branch"]
+
     dest = os.path.abspath(args.output_dir or get_default_output_dir())
+    exclude_list = [p.strip() for p in (args.exclude or "").split(",") if p.strip()]
+    only_list = [p.strip() for p in (args.only or "").split(",") if p.strip()]
 
     if args.setup_schedule:
         return 0 if setup_schedule(dest) else 1
@@ -353,20 +587,28 @@ def main() -> int:
     if args.clear_schedule:
         return 0 if clear_schedule() else 1
 
+    if args.status:
+        return run_status(dest, args.require_branch)
+
     if args.pull_only:
         n = pull_all_repos(dest)
         print(f"Pulled {n} repo(s).")
         return 0
 
+    # From here we need repo list from GitHub (--list, --sync, or default clone)
     if not ensure_gh_ready():
         return 1
-    if not args.dry_run and not os.path.isdir(dest):
+    if not args.dry_run and not args.list_repos and not os.path.isdir(dest):
         os.makedirs(dest, exist_ok=True)
 
-    print(f"Clone target: {dest}")
-    print("Fetching repository list from GitHub...")
     try:
-        repos = get_repo_list(args.owner, args.limit)
+        repos = get_repo_list(
+            args.owner,
+            args.limit,
+            no_archived=args.no_archived,
+            exclude=exclude_list,
+            only=only_list,
+        )
     except subprocess.CalledProcessError as e:
         print(f"Error listing repos: {e.stderr or e}", file=sys.stderr)
         return 1
@@ -378,12 +620,38 @@ def main() -> int:
         print("No repositories found.")
         return 0
 
-    print(f"Found {len(repos)} repo(s). {'[DRY RUN]' if args.dry_run else ''}")
+    if args.list_repos:
+        for r in repos:
+            print(r["name"])
+        return 0
+
     url_key = "sshUrl" if args.ssh else "url"
+
+    if args.sync:
+        print(f"Sync target: {dest}")
+        print("Fetching repository list from GitHub...")
+        cloned, pulled = sync_repos(repos, dest, url_key, args.shallow, max(1, args.jobs))
+        print(f"Done: {cloned} cloned, {pulled} pulled.")
+        return 0
+
+    # Default: clone only (no pull)
+    print(f"Clone target: {dest}")
+    print("Fetching repository list from GitHub...")
+    print(f"Found {len(repos)} repo(s). {'[DRY RUN]' if args.dry_run else ''}")
     ok = 0
-    for r in repos:
-        if clone_repo(r[url_key], dest, args.ssh, args.dry_run):
-            ok += 1
+    if args.jobs <= 1:
+        for r in repos:
+            if clone_repo(r[url_key], dest, args.ssh, args.dry_run, args.shallow, verbose_skip=True):
+                ok += 1
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+            futures = {
+                ex.submit(clone_repo, r[url_key], dest, args.ssh, args.dry_run, args.shallow, True): r
+                for r in repos
+            }
+            for fut in as_completed(futures):
+                if fut.result():
+                    ok += 1
     print(f"Done: {ok}/{len(repos)} repos.")
     return 0 if ok == len(repos) else 1
 
