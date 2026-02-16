@@ -8,7 +8,6 @@ import argparse
 import fnmatch
 import json
 import os
-import getpass
 import platform
 import smtplib
 import ssl
@@ -226,18 +225,23 @@ def _create_windows_runner_script(output_dir: str) -> str:
 
 
 def _create_windows_task_with_powershell(task_command: str) -> tuple[bool, str]:
-    """Create scheduled task with wake support using ScheduledTasks module."""
-    user = getpass.getuser()
+    """Create scheduled task with wake support and run-when-logged-off behavior."""
+    domain = (os.environ.get("USERDOMAIN") or "").strip()
+    username = (os.environ.get("USERNAME") or "").strip()
+    if domain and username:
+        user_id = f"{domain}\\{username}"
+    else:
+        user_id = username or "SYSTEM"
     escaped_command = task_command.replace("'", "''")
-    escaped_user = user.replace("'", "''")
+    escaped_user = user_id.replace("'", "''")
     ps_script = (
         "$ErrorActionPreference = 'Stop'; "
         f"$taskName = '{TASK_NAME}'; "
         f"$taskCommand = '{escaped_command}'; "
         "$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c \"' + $taskCommand + '\"'); "
         "$trigger = New-ScheduledTaskTrigger -Daily -At 2:00AM; "
-        "$settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable; "
-        f"$principal = New-ScheduledTaskPrincipal -UserId '{escaped_user}' -LogonType Interactive -RunLevel Limited; "
+        "$settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; "
+        f"$principal = New-ScheduledTaskPrincipal -UserId '{escaped_user}' -LogonType S4U -RunLevel Limited; "
         "if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { "
         "Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null }; "
         "Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null"
@@ -294,7 +298,7 @@ def setup_schedule_windows(output_dir: str) -> bool:
     runner = _create_windows_runner_script(output_dir)
     ok, err = _create_windows_task_with_powershell(runner)
     if ok:
-        print("Scheduled task created: runs daily at 2:00 AM (local time), wakes PC, then sleeps after run.")
+        print("Scheduled task created: runs daily at 2:00 AM (local time), wakes PC, runs even when logged off, then sleeps after run.")
         print(f"  Runner script: {runner}")
         return True
     # Fallback to schtasks if ScheduledTasks module/capabilities are unavailable.

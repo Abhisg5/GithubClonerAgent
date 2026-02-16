@@ -69,6 +69,7 @@ The scheduled run does a **full sync**:
 4. **Email** (if configured): send a summary (cloned, pulled, committed, PR links, errors).
 
 - **Windows:** Uses Task Scheduler with wake support where available.  
+  Registers task to run whether user is logged on or not (S4U).  
   Task name: `GithubClonerAgent-daily-pull`.  
   Creates runner: `GithubClonerAgent/run_sync_windows.cmd` (runs sync, then requests sleep).
 - **macOS:** Uses `launchd` at **2:00 AM local time** plus a wake timer attempt at **1:58 AM**.  
