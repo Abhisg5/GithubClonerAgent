@@ -8,6 +8,7 @@ import argparse
 import fnmatch
 import json
 import os
+import getpass
 import platform
 import smtplib
 import ssl
@@ -22,8 +23,7 @@ from email.mime.multipart import MIMEMultipart
 
 GH_INSTALL_URL = "https://cli.github.com/"
 TASK_NAME = "GithubClonerAgent-daily-pull"
-# 2 AM EST = 7:00 UTC (cron uses UTC on most systems)
-CRON_TIME_UTC = "7"  # hour for 0 7 * * *
+LAUNCH_AGENT_LABEL = "com.githubcloneragent.daily-sync"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = "config.json"
@@ -195,6 +195,63 @@ def _pull_one(path: str) -> tuple[str, bool, str]:
         return (name, False, str(e)[:200])
 
 
+def _write_file(path: str, content: str, mode: int | None = None) -> None:
+    """Write text file and optionally chmod mode."""
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+
+def _create_windows_runner_script(output_dir: str) -> str:
+    """Create cmd script that runs sync then requests sleep."""
+    python_exe = sys.executable
+    script_py = os.path.join(SCRIPT_DIR, "clone_repos.py")
+    runner = os.path.join(SCRIPT_DIR, "run_sync_windows.cmd")
+    content = (
+        "@echo off\n"
+        "setlocal\n"
+        f"\"{python_exe}\" \"{script_py}\" --sync -o \"{output_dir}\"\n"
+        "set \"EXITCODE=%ERRORLEVEL%\"\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"Add-Type -AssemblyName System.Windows.Forms; "
+        "[System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)\" >NUL 2>&1\n"
+        "exit /b %EXITCODE%\n"
+    )
+    _write_file(runner, content)
+    return runner
+
+
+def _create_windows_task_with_powershell(task_command: str) -> tuple[bool, str]:
+    """Create scheduled task with wake support using ScheduledTasks module."""
+    user = getpass.getuser()
+    escaped_command = task_command.replace("'", "''")
+    escaped_user = user.replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$taskName = '{TASK_NAME}'; "
+        f"$taskCommand = '{escaped_command}'; "
+        "$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c \"' + $taskCommand + '\"'); "
+        "$trigger = New-ScheduledTaskTrigger -Daily -At 2:00AM; "
+        "$settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable; "
+        f"$principal = New-ScheduledTaskPrincipal -UserId '{escaped_user}' -LogonType Interactive -RunLevel Limited; "
+        "if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { "
+        "Unregister-ScheduledTask -TaskName $taskName -Confirm:$false | Out-Null }; "
+        "Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    return False, (result.stderr or result.stdout or "unknown error").strip()
+
+
 def pull_all_repos(
     output_dir: str,
     jobs: int = 1,
@@ -233,11 +290,15 @@ def pull_all_repos(
 
 
 def setup_schedule_windows(output_dir: str) -> bool:
-    """Create Windows scheduled task: daily at 2 AM (local time). Runs full sync (clone new + pull)."""
-    python_exe = sys.executable
-    script_py = os.path.join(SCRIPT_DIR, "clone_repos.py")
-    cmd = f'"{python_exe}" "{script_py}" --sync -o "{output_dir}"'
-    # Run at 2:00 AM local time (user should set timezone to Eastern for 2 AM EST)
+    """Create Windows scheduled task that can wake from sleep and then sleep again."""
+    runner = _create_windows_runner_script(output_dir)
+    ok, err = _create_windows_task_with_powershell(runner)
+    if ok:
+        print("Scheduled task created: runs daily at 2:00 AM (local time), wakes PC, then sleeps after run.")
+        print(f"  Runner script: {runner}")
+        return True
+    # Fallback to schtasks if ScheduledTasks module/capabilities are unavailable.
+    cmd = f'"{runner}"'
     try:
         subprocess.run(
             [
@@ -250,49 +311,112 @@ def setup_schedule_windows(output_dir: str) -> bool:
             capture_output=True,
             text=True,
         )
-        print("Scheduled task created: runs daily at 2:00 AM (local time).")
-        print("  Set system timezone to Eastern for 2 AM EST.")
+        print("Scheduled task created (fallback): runs daily at 2:00 AM (local time).")
+        print("  Wake from sleep was not enabled automatically.")
+        print("  To enable wake timers: Power Options -> Sleep -> Allow wake timers -> Enable.")
+        print(f"  Fallback reason: {err}")
         return True
     except subprocess.CalledProcessError as e:
         print(f"Failed to create scheduled task: {e.stderr or e}", file=sys.stderr)
         return False
 
 
-def setup_schedule_mac(output_dir: str) -> bool:
-    """Add cron job: daily at 2 AM EST (7 AM UTC). Runs full sync (clone new + pull)."""
+def _create_mac_runner_script(output_dir: str) -> tuple[str, str]:
+    """Create macOS shell script that runs sync and then requests sleep."""
     python_exe = sys.executable
     script_py = os.path.join(SCRIPT_DIR, "clone_repos.py")
     log_file = os.path.join(SCRIPT_DIR, "sync.log")
-    # 0 7 * * * = 7:00 UTC = 2 AM EST
-    cron_cmd = f'{python_exe} "{script_py}" --sync -o "{output_dir}" >> "{log_file}" 2>&1'
-    cron_line = f"0 7 * * * {cron_cmd}"
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"],
-            capture_output=True,
-            text=True,
-        )
-        existing = result.stdout if result.returncode == 0 else ""
-        # Avoid duplicate (match --sync or legacy --pull-only)
-        if TASK_NAME in existing or ("clone_repos.py" in existing and ("--sync" in existing or "--pull-only" in existing)):
-            print("Cron entry already present.")
-            return True
-        new_crontab = (existing.rstrip() + "\n" + cron_line + "\n").lstrip()
-        proc = subprocess.run(
-            ["crontab", "-"],
-            input=new_crontab,
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            print(f"Failed to install crontab: {proc.stderr}", file=sys.stderr)
-            return False
-        print("Cron job added: runs daily at 2 AM EST (7:00 UTC).")
-        print(f"  Log: {log_file}")
-        return True
-    except FileNotFoundError:
-        print("crontab not found. Install cron or add the job manually.", file=sys.stderr)
+    runner = os.path.join(SCRIPT_DIR, "run_sync_mac.sh")
+    content = (
+        "#!/bin/bash\n"
+        "set +e\n"
+        f"\"{python_exe}\" \"{script_py}\" --sync -o \"{output_dir}\" >> \"{log_file}\" 2>&1\n"
+        "if command -v osascript >/dev/null 2>&1; then\n"
+        "  osascript -e 'tell application \"System Events\" to sleep' >/dev/null 2>&1 || true\n"
+        "fi\n"
+    )
+    _write_file(runner, content, mode=0o755)
+    return runner, log_file
+
+
+def _ensure_mac_launch_agent(runner_script: str, log_file: str) -> tuple[bool, str]:
+    """Install and load a LaunchAgent for daily 2 AM run."""
+    launch_agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+    os.makedirs(launch_agents_dir, exist_ok=True)
+    plist_path = os.path.join(launch_agents_dir, f"{LAUNCH_AGENT_LABEL}.plist")
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>{runner_script}</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>{log_file}</string>
+  <key>StandardErrorPath</key>
+  <string>{log_file}</string>
+</dict>
+</plist>
+"""
+    _write_file(plist_path, plist)
+    unload = subprocess.run(
+        ["launchctl", "unload", plist_path],
+        capture_output=True,
+        text=True,
+    )
+    _ = unload  # best effort; ignore unload errors if not loaded yet
+    load = subprocess.run(
+        ["launchctl", "load", plist_path],
+        capture_output=True,
+        text=True,
+    )
+    if load.returncode != 0:
+        return False, (load.stderr or load.stdout or "launchctl load failed").strip()
+    return True, plist_path
+
+
+def _attempt_mac_wake_schedule() -> tuple[bool, str]:
+    """
+    Try to schedule wake at 1:58 AM daily.
+    Usually requires sudo privileges; return guidance on failure.
+    """
+    cmd = ["pmset", "repeat", "wakeorpoweron", "MTWRFSU", "01:58:00"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0:
+        return True, "Wake schedule installed with pmset."
+    return False, "Run this once to enable wake schedule: sudo pmset repeat wakeorpoweron MTWRFSU 01:58:00"
+
+
+def setup_schedule_mac(output_dir: str) -> bool:
+    """Install macOS launchd schedule and try to install wake timer."""
+    runner, log_file = _create_mac_runner_script(output_dir)
+    ok, info = _ensure_mac_launch_agent(runner, log_file)
+    if not ok:
+        print(f"Failed to install launch agent: {info}", file=sys.stderr)
         return False
+    wake_ok, wake_info = _attempt_mac_wake_schedule()
+    print("LaunchAgent installed: runs daily at 2:00 AM (local time).")
+    print(f"  LaunchAgent plist: {info}")
+    print(f"  Runner script: {runner}")
+    print(f"  Log: {log_file}")
+    if wake_ok:
+        print("Wake timer configured for 1:58 AM daily.")
+    else:
+        print(wake_info)
+    return True
 
 
 def setup_schedule(output_dir: str) -> bool:
@@ -324,13 +448,19 @@ def clear_schedule_windows() -> bool:
 
 
 def clear_schedule_mac() -> bool:
-    """Remove the GithubClonerAgent cron job."""
+    """Remove macOS LaunchAgent schedule and legacy cron entries."""
     try:
-        result = subprocess.run(
-            ["crontab", "-l"],
-            capture_output=True,
-            text=True,
-        )
+        launch_agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+        plist_path = os.path.join(launch_agents_dir, f"{LAUNCH_AGENT_LABEL}.plist")
+        if os.path.exists(plist_path):
+            subprocess.run(["launchctl", "unload", plist_path], capture_output=True, text=True)
+            os.remove(plist_path)
+            print("LaunchAgent removed.")
+        else:
+            print("No LaunchAgent found (already removed or never set).")
+
+        # Also clear legacy cron entry if present.
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
         existing = result.stdout if result.returncode == 0 else ""
         marker = "clone_repos.py"
         new_lines = [
@@ -346,9 +476,8 @@ def clear_schedule_mac() -> bool:
                 text=True,
                 check=True,
             )
-            print("Cron job removed.")
-        else:
-            print("No cron job found (already removed or never set).")
+            print("Legacy cron entry removed.")
+        print("If you set mac wake timers, remove with: sudo pmset repeat cancel")
         return True
     except subprocess.CalledProcessError as e:
         print(f"Failed to update crontab: {e.stderr or e}", file=sys.stderr)
@@ -365,6 +494,22 @@ def clear_schedule() -> bool:
     if sys.platform == "darwin":
         return clear_schedule_mac()
     print("Schedule clear is supported on Windows and macOS only.", file=sys.stderr)
+    return False
+
+
+def test_schedule_now(output_dir: str) -> bool:
+    """Run the platform runner now to test sync + sleep behavior."""
+    if sys.platform == "win32":
+        runner = _create_windows_runner_script(output_dir)
+        print(f"Running scheduler test now via: {runner}")
+        r = subprocess.run(["cmd", "/c", runner], capture_output=False, text=False)
+        return r.returncode == 0
+    if sys.platform == "darwin":
+        runner, _ = _create_mac_runner_script(output_dir)
+        print(f"Running scheduler test now via: {runner}")
+        r = subprocess.run(["/bin/bash", runner], capture_output=False, text=False)
+        return r.returncode == 0
+    print("Scheduler test is supported on Windows and macOS only.", file=sys.stderr)
     return False
 
 
@@ -423,6 +568,18 @@ def get_device_info() -> str:
     release = platform.release()
     user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
     return f"{host} ({system} {release}) — user: {user}"
+
+
+def get_branch_device_suffix() -> str:
+    """Return a git-branch-safe, short device suffix from hostname."""
+    host = (platform.node() or "unknown").strip().lower()
+    safe = "".join(ch if ch.isalnum() else "-" for ch in host)
+    while "--" in safe:
+        safe = safe.replace("--", "-")
+    safe = safe.strip("-")
+    if not safe:
+        safe = "unknown"
+    return safe[:24]
 
 
 def build_notification_body(
@@ -707,13 +864,14 @@ def sync_repos(
     return cloned, pulled, cloned_names, pulled_names, pull_failed
 
 
-def _commit_and_pr_one(repo_path: str, date_str: str) -> tuple[str, bool, str | None, str | None]:
+def _commit_and_pr_one(
+    repo_path: str, date_str: str, branch: str
+) -> tuple[str, bool, str | None, str | None]:
     """
-    If repo has local changes: create/checkout feature/date, commit, push, create PR.
+    If repo has local changes: create/checkout feature/date-device, commit, push, create PR.
     Returns (repo_name, committed, pr_url, error). pr_url and error are None on success.
     """
     name = os.path.basename(repo_path)
-    branch = f"feature/{date_str}"
     try:
         r = run_cmd(["git", "-C", repo_path, "status", "--porcelain"], check=False)
         if not r.stdout.strip():
@@ -764,10 +922,10 @@ def _commit_and_pr_one(repo_path: str, date_str: str) -> tuple[str, bool, str | 
 
 
 def commit_and_push_changes(
-    dest: str, repo_names: set[str], date_str: str
+    dest: str, repo_names: set[str], date_str: str, branch: str
 ) -> tuple[list[str], list[tuple[str, str]], list[tuple[str, str]]]:
     """
-    For each repo in dest that has local changes: commit to feature/date, push, create PR.
+    For each repo in dest that has local changes: commit to feature/date-device, push, create PR.
     Returns (committed_names, list of (name, pr_url), list of (name, error)).
     """
     committed: list[str] = []
@@ -777,7 +935,7 @@ def commit_and_push_changes(
         path = os.path.join(dest, name)
         if not os.path.isdir(path) or not os.path.isdir(os.path.join(path, ".git")):
             continue
-        repo_name, did_commit, pr_url, err = _commit_and_pr_one(path, date_str)
+        repo_name, did_commit, pr_url, err = _commit_and_pr_one(path, date_str, branch)
         if err:
             errors.append((repo_name, err))
             print(f"  commit/PR error {repo_name}: {err}", file=sys.stderr)
@@ -824,12 +982,17 @@ def main() -> int:
     parser.add_argument(
         "--setup-schedule",
         action="store_true",
-        help="Install daily task at 2 AM EST to run --sync (clone new + pull existing).",
+        help="Install daily 2 AM local task with wake/sleep behavior to run --sync.",
     )
     parser.add_argument(
         "--clear-schedule",
         action="store_true",
         help="Remove the daily scheduled task or cron job.",
+    )
+    parser.add_argument(
+        "--test-schedule-now",
+        action="store_true",
+        help="Run the same scheduled runner now (sync, then sleep).",
     )
     parser.add_argument(
         "-o", "--output-dir",
@@ -917,6 +1080,8 @@ def main() -> int:
 
     if args.clear_schedule:
         return 0 if clear_schedule() else 1
+    if args.test_schedule_now:
+        return 0 if test_schedule_now(dest) else 1
 
     if args.status:
         if not ensure_gh_ready():
@@ -1008,9 +1173,10 @@ def main() -> int:
         commit_errors: list[tuple[str, str]] = []
         if not args.dry_run:
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            branch = f"feature/{date_str}-{get_branch_device_suffix()}"
             repo_names = {r["name"].split("/")[-1] for r in repos}
-            print("Checking for local changes to commit and open PRs...")
-            committed_names, prs, commit_errors = commit_and_push_changes(dest, repo_names, date_str)
+            print(f"Checking for local changes to commit and open PRs on branch: {branch}")
+            committed_names, prs, commit_errors = commit_and_push_changes(dest, repo_names, date_str, branch)
             if committed_names:
                 print(f"Committed: {len(committed_names)} repo(s). PRs created: {len(prs)}.")
             if commit_errors:

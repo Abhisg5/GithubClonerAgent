@@ -1,6 +1,6 @@
 # GithubClonerAgent
 
-Keep all your GitHub repos in one folder, in sync across machines. Clone missing repos, pull existing ones, and optionally commit local changes to a `feature/YYYY-MM-DD` branch and open a PR to `main`. Runs on **macOS and Windows**; supports a daily 2 AM EST job and email summaries.
+Keep all your GitHub repos in one folder, in sync across machines. Clone missing repos, pull existing ones, and optionally commit local changes to a `feature/YYYY-MM-DD-DEVICE` branch and open a PR to `main`. Runs on **macOS and Windows**; supports a daily 2 AM local-time job with wake/sleep automation and email summaries.
 
 **All commands operate only on repos from your GitHub account** (via `gh repo list`). Other folders in the output directory (e.g. local-only projects) are ignored.
 
@@ -22,7 +22,7 @@ cd GithubClonerAgent
 python clone_repos.py --sync
 ```
 
-This clones any repos you don’t have yet, pulls the rest, and for any repo with uncommitted changes: creates `feature/YYYY-MM-DD`, commits, pushes, and opens a PR to `main`. Repos are placed in the **Programming** folder (parent of `GithubClonerAgent`) unless you set `-o` or `config.json`.
+This clones any repos you don’t have yet, pulls the rest, and for any repo with uncommitted changes: creates `feature/YYYY-MM-DD-DEVICE`, commits, pushes, and opens a PR to `main`. Repos are placed in the **Programming** folder (parent of `GithubClonerAgent`) unless you set `-o` or `config.json`.
 
 ---
 
@@ -36,8 +36,9 @@ This clones any repos you don’t have yet, pulls the rest, and for any repo wit
 | `python clone_repos.py --status` | Show branch, ahead/behind, and dirty state for each repo in your GitHub list. |
 | `python clone_repos.py --list` | Print repo names from GitHub (with your filters). No disk changes. |
 | `python clone_repos.py --dry-run` | Show what would be cloned; no clone/pull/commit. |
-| `python clone_repos.py --setup-schedule` | Install daily 2 AM EST task (clone + pull + commit/PR). |
-| `python clone_repos.py --clear-schedule` | Remove the 2 AM scheduled task or cron job. |
+| `python clone_repos.py --setup-schedule` | Install daily 2 AM local-time task (clone + pull + commit/PR) with wake/sleep behavior. |
+| `python clone_repos.py --clear-schedule` | Remove the 2 AM scheduled task (and legacy cron entry on macOS). |
+| `python clone_repos.py --test-schedule-now` | Run the scheduled runner immediately (`--sync`, then request sleep). |
 
 ---
 
@@ -64,17 +65,26 @@ The scheduled run does a **full sync**:
 
 1. **Clone** any repos you don’t have locally.
 2. **Pull** all existing repos from your GitHub list.
-3. **Commit & PR:** For each repo with uncommitted changes, create branch `feature/YYYY-MM-DD`, commit all changes, push, and open a PR into `main`. Repos with no changes are left alone.
+3. **Commit & PR:** For each repo with uncommitted changes, create branch `feature/YYYY-MM-DD-DEVICE` (device = hostname, sanitized), commit all changes, push, and open a PR into `main`. Repos with no changes are left alone.
 4. **Email** (if configured): send a summary (cloned, pulled, committed, PR links, errors).
 
-- **Windows:** Task runs at **2:00 AM** local time. Set timezone to Eastern for 2 AM EST.  
-  Task name: `GithubClonerAgent-daily-pull`.
-- **macOS:** Cron at **7:00 UTC** (= 2 AM Eastern). Log: `GithubClonerAgent/sync.log`.
+- **Windows:** Uses Task Scheduler with wake support where available.  
+  Task name: `GithubClonerAgent-daily-pull`.  
+  Creates runner: `GithubClonerAgent/run_sync_windows.cmd` (runs sync, then requests sleep).
+- **macOS:** Uses `launchd` at **2:00 AM local time** plus a wake timer attempt at **1:58 AM**.  
+  Creates runner: `GithubClonerAgent/run_sync_mac.sh` (runs sync, then requests sleep).  
+  Log: `GithubClonerAgent/sync.log`.
 
 **Setup (once per machine):**
 
 ```bash
 python clone_repos.py --setup-schedule
+```
+
+**Test immediately (without waiting for 2 AM):**
+
+```bash
+python clone_repos.py --test-schedule-now
 ```
 
 **Remove:**
@@ -84,7 +94,26 @@ python clone_repos.py --clear-schedule
 ```
 
 Or: **Windows** — `schtasks /delete /tn GithubClonerAgent-daily-pull /f`  
-**macOS** — `crontab -e` and delete the line with `clone_repos.py --sync`.
+**macOS** — `launchctl unload ~/Library/LaunchAgents/com.githubcloneragent.daily-sync.plist && rm ~/Library/LaunchAgents/com.githubcloneragent.daily-sync.plist`
+
+If wake timer was added on macOS and you want to remove it too:
+
+```bash
+sudo pmset repeat cancel
+```
+
+---
+
+### Sleep/Wake behavior notes
+
+- A sleeping computer cannot execute jobs until it wakes.
+- **Windows:** `--setup-schedule` first tries a wake-capable task (`WakeToRun`, `StartWhenAvailable`). If that is unavailable, it falls back to basic `schtasks`.
+- **macOS:** `--setup-schedule` installs a LaunchAgent and tries to set wake with `pmset repeat wakeorpoweron MTWRFSU 01:58:00`.
+- If macOS wake timer setup needs privileges, run this once manually:
+
+```bash
+sudo pmset repeat wakeorpoweron MTWRFSU 01:58:00
+```
 
 ---
 
@@ -152,14 +181,14 @@ If you use **`GITHUB_CLONER_AGENT_SMTP_PASSWORD`** instead of a gist or `smtp_pa
 
 Restart the terminal (or reboot) so the 2 AM task sees the variable.
 
-**macOS (persistent for your user; cron will see it if your shell loads this file):**
+**macOS (persistent for your user; scheduler run will use this if set in your login environment):**
 
 1. Edit your shell config (e.g. `~/.zshrc` or `~/.bash_profile`):
    ```bash
    echo 'export GITHUB_CLONER_AGENT_SMTP_PASSWORD="your-app-password-here"' >> ~/.zshrc
    ```
 2. Reload: `source ~/.zshrc` (or open a new terminal).
-3. Cron runs with a minimal environment; for the 2 AM job to see the variable, ensure cron is started from a login that has this in its profile, or set it in **System** → **Users & Groups** → your user → **Login items** / **Launch Agents**, or add the export in a file that your default shell sources at login.
+3. If the scheduler cannot see your env var, prefer putting the SMTP password in `config.json` via `smtp_password_gist_raw_url`, or configure user-level launch environment so your 2 AM job inherits it.
 
 **Or for the current terminal only (temporary):**
 
@@ -182,4 +211,4 @@ Restart the terminal (or reboot) so the 2 AM task sees the variable.
 - **Windows:** `python clone_repos.py` or `py clone_repos.py`
 - **macOS:** `python3 clone_repos.py` or `python clone_repos.py`
 
-Schedule and email work the same on both; only the 2 AM trigger differs (Task Scheduler vs cron).
+Email works the same on both. Scheduler uses Task Scheduler on Windows and LaunchAgent on macOS.
