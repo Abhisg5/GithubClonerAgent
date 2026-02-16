@@ -132,13 +132,48 @@ After a **sync** or **pull-only** run, the script can send one email with:
 
 **Gmail:** Use an [App Password](https://support.google.com/accounts/answer/185833) with 2FA. `smtp_host`: `smtp.gmail.com`, `smtp_port`: `587`.
 
+### Setting the SMTP password environment variable
+
+If you use **`GITHUB_CLONER_AGENT_SMTP_PASSWORD`** instead of a gist or `smtp_password` in config:
+
+**Windows (persistent for your user; 2 AM task will see it):**
+
+1. Open **Settings** → **System** → **About** → **Advanced system settings** → **Environment Variables**.
+2. Under **User variables**, click **New**.
+3. Variable name: `GITHUB_CLONER_AGENT_SMTP_PASSWORD`  
+   Variable value: your app password (e.g. Gmail app password).
+4. OK out. Restart any open terminals (and the 2 AM scheduled task runs as your user, so it will pick this up after next login or reboot).
+
+**Or in PowerShell (current user, persistent):**
+
+```powershell
+[System.Environment]::SetEnvironmentVariable('GITHUB_CLONER_AGENT_SMTP_PASSWORD', 'your-app-password-here', 'User')
+```
+
+Restart the terminal (or reboot) so the 2 AM task sees the variable.
+
+**macOS (persistent for your user; cron will see it if your shell loads this file):**
+
+1. Edit your shell config (e.g. `~/.zshrc` or `~/.bash_profile`):
+   ```bash
+   echo 'export GITHUB_CLONER_AGENT_SMTP_PASSWORD="your-app-password-here"' >> ~/.zshrc
+   ```
+2. Reload: `source ~/.zshrc` (or open a new terminal).
+3. Cron runs with a minimal environment; for the 2 AM job to see the variable, ensure cron is started from a login that has this in its profile, or set it in **System** → **Users & Groups** → your user → **Login items** / **Launch Agents**, or add the export in a file that your default shell sources at login.
+
+**Or for the current terminal only (temporary):**
+
+- **Windows (CMD):** `set GITHUB_CLONER_AGENT_SMTP_PASSWORD=your-app-password`
+- **Windows (PowerShell):** `$env:GITHUB_CLONER_AGENT_SMTP_PASSWORD = 'your-app-password'`
+- **macOS/Linux:** `export GITHUB_CLONER_AGENT_SMTP_PASSWORD='your-app-password'`
+
 ---
 
 ## Keeping the SMTP password secret (public repo)
 
 - **Do not commit** `config.json` (it’s gitignored).
 - Prefer **`smtp_password_gist_raw_url`** (secret gist) or **`GITHUB_CLONER_AGENT_SMTP_PASSWORD`** so the password is never in the repo.
-- On each new machine: copy `config.example.json` to `config.json`, fill in options and (if you use it) the gist URL. For env var: set `GITHUB_CLONER_AGENT_SMTP_PASSWORD` in the system/user environment so the 2 AM task can use it.
+- On each new machine: copy `config.example.json` to `config.json`, fill in options and (if you use it) the gist URL. For env var: set `GITHUB_CLONER_AGENT_SMTP_PASSWORD` as above so the 2 AM task can use it.
 
 ---
 
