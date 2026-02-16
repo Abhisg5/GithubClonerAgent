@@ -570,6 +570,18 @@ def get_device_info() -> str:
     return f"{host} ({system} {release}) — user: {user}"
 
 
+def get_branch_device_suffix() -> str:
+    """Return a git-branch-safe, short device suffix from hostname."""
+    host = (platform.node() or "unknown").strip().lower()
+    safe = "".join(ch if ch.isalnum() else "-" for ch in host)
+    while "--" in safe:
+        safe = safe.replace("--", "-")
+    safe = safe.strip("-")
+    if not safe:
+        safe = "unknown"
+    return safe[:24]
+
+
 def build_notification_body(
     sync_type: str,
     output_dir: str,
@@ -852,13 +864,14 @@ def sync_repos(
     return cloned, pulled, cloned_names, pulled_names, pull_failed
 
 
-def _commit_and_pr_one(repo_path: str, date_str: str) -> tuple[str, bool, str | None, str | None]:
+def _commit_and_pr_one(
+    repo_path: str, date_str: str, branch: str
+) -> tuple[str, bool, str | None, str | None]:
     """
-    If repo has local changes: create/checkout feature/date, commit, push, create PR.
+    If repo has local changes: create/checkout feature/date-device, commit, push, create PR.
     Returns (repo_name, committed, pr_url, error). pr_url and error are None on success.
     """
     name = os.path.basename(repo_path)
-    branch = f"feature/{date_str}"
     try:
         r = run_cmd(["git", "-C", repo_path, "status", "--porcelain"], check=False)
         if not r.stdout.strip():
@@ -909,10 +922,10 @@ def _commit_and_pr_one(repo_path: str, date_str: str) -> tuple[str, bool, str | 
 
 
 def commit_and_push_changes(
-    dest: str, repo_names: set[str], date_str: str
+    dest: str, repo_names: set[str], date_str: str, branch: str
 ) -> tuple[list[str], list[tuple[str, str]], list[tuple[str, str]]]:
     """
-    For each repo in dest that has local changes: commit to feature/date, push, create PR.
+    For each repo in dest that has local changes: commit to feature/date-device, push, create PR.
     Returns (committed_names, list of (name, pr_url), list of (name, error)).
     """
     committed: list[str] = []
@@ -922,7 +935,7 @@ def commit_and_push_changes(
         path = os.path.join(dest, name)
         if not os.path.isdir(path) or not os.path.isdir(os.path.join(path, ".git")):
             continue
-        repo_name, did_commit, pr_url, err = _commit_and_pr_one(path, date_str)
+        repo_name, did_commit, pr_url, err = _commit_and_pr_one(path, date_str, branch)
         if err:
             errors.append((repo_name, err))
             print(f"  commit/PR error {repo_name}: {err}", file=sys.stderr)
@@ -1160,9 +1173,10 @@ def main() -> int:
         commit_errors: list[tuple[str, str]] = []
         if not args.dry_run:
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            branch = f"feature/{date_str}-{get_branch_device_suffix()}"
             repo_names = {r["name"].split("/")[-1] for r in repos}
-            print("Checking for local changes to commit and open PRs...")
-            committed_names, prs, commit_errors = commit_and_push_changes(dest, repo_names, date_str)
+            print(f"Checking for local changes to commit and open PRs on branch: {branch}")
+            committed_names, prs, commit_errors = commit_and_push_changes(dest, repo_names, date_str, branch)
             if committed_names:
                 print(f"Committed: {len(committed_names)} repo(s). PRs created: {len(prs)}.")
             if commit_errors:

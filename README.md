@@ -1,6 +1,6 @@
 # GithubClonerAgent
 
-Keep all your GitHub repos in one folder, in sync across machines. Clone missing repos, pull existing ones, and optionally commit local changes to a `feature/YYYY-MM-DD` branch and open a PR to `main`. Runs on **macOS and Windows**; supports a daily 2 AM local-time job with wake/sleep automation and email summaries.
+Keep all your GitHub repos in one folder, in sync across machines. Clone missing repos, pull existing ones, and optionally commit local changes to a `feature/YYYY-MM-DD-DEVICE` branch and open a PR to `main`. Runs on **macOS and Windows**; supports a daily 2 AM local-time job with wake/sleep automation and email summaries.
 
 **All commands operate only on repos from your GitHub account** (via `gh repo list`). Other folders in the output directory (e.g. local-only projects) are ignored.
 
@@ -22,7 +22,7 @@ cd GithubClonerAgent
 python clone_repos.py --sync
 ```
 
-This clones any repos you don’t have yet, pulls the rest, and for any repo with uncommitted changes: creates `feature/YYYY-MM-DD`, commits, pushes, and opens a PR to `main`. Repos are placed in the **Programming** folder (parent of `GithubClonerAgent`) unless you set `-o` or `config.json`.
+This clones any repos you don’t have yet, pulls the rest, and for any repo with uncommitted changes: creates `feature/YYYY-MM-DD-DEVICE`, commits, pushes, and opens a PR to `main`. Repos are placed in the **Programming** folder (parent of `GithubClonerAgent`) unless you set `-o` or `config.json`.
 
 ---
 
@@ -65,7 +65,7 @@ The scheduled run does a **full sync**:
 
 1. **Clone** any repos you don’t have locally.
 2. **Pull** all existing repos from your GitHub list.
-3. **Commit & PR:** For each repo with uncommitted changes, create branch `feature/YYYY-MM-DD`, commit all changes, push, and open a PR into `main`. Repos with no changes are left alone.
+3. **Commit & PR:** For each repo with uncommitted changes, create branch `feature/YYYY-MM-DD-DEVICE` (device = hostname, sanitized), commit all changes, push, and open a PR into `main`. Repos with no changes are left alone.
 4. **Email** (if configured): send a summary (cloned, pulled, committed, PR links, errors).
 
 - **Windows:** Uses Task Scheduler with wake support where available.  
